@@ -1,0 +1,75 @@
+; PlatformIO Project Configuration File
+;
+;   Build options: build flags, source filter
+;   Upload options: custom upload port, speed and extra flags
+;   Library options: dependencies, extra library storages
+;   Advanced options: extra scripting
+;
+; Please visit documentation for the other options and examples
+; https://docs.platformio.org/page/projectconf.html
+
+; ============================================================================
+; High-Speed Vibration Data Logger (V2) — WeAct STM32F405RGT6 mini core board
+; Framework: STM32 HAL via CubeMX-generated sources (NOT Arduino).
+; The CubeMX .ioc + generated code live in src/ ; FatFs ships with the HAL.
+; ============================================================================
+
+[env:genericSTM32F405RG]
+platform = ststm32
+board    = genericSTM32F405RG
+framework = stm32cube
+
+; --- Build flags -----------------------------------------------------------
+build_flags = 
+    ; STM32 HAL driver selection (required by the CubeMX-generated code)
+    -DUSE_HAL_DRIVER
+    -DSTM32F405xx
+    -DHSE_VALUE=8000000    ; <--- ВОТ ЭТА СТРОКА
+    ; Cortex-M4F hardware FPU — single-precision VFPv4 (fast float calibration in ISR)
+    ;-mcpu=cortex-m4
+    ;-mfpu=fpv4-sp-d16
+    ;-mfloat-abi=hard
+
+            ; ===== DEBUG PROFILE (step-by-step ST-LINK debugging) ==================
+    ; Effective optimization level was -Os, NOT -O2: ststm32 appends its own
+    ; -Os AFTER build_flags (doc/final_pre_flash_audit.md W-1 / I5).
+    ; Local variables (prealloc_ok, tr, ...) get optimized out => GDB prints
+    ; "<optimized out>" and single-stepping jumps around. Hence -O0 -g3 plus
+    ; build_unflags = -Os below.
+    ;
+    ; P2-10 (audit WARN-5) rationale is UNCHANGED: no -Ofast / -ffast-math.
+    ; -ffast-math re-associates float math, so the calibration path (float gain
+    ; in sd_writer.h, offsets) is not bit-reproducible between compiler
+    ; versions — a reproducibility defect for a measuring instrument.
+    ; ststm32 still supplies -mfpu=fpv4-sp-d16 -mfloat-abi=softfp, so the FPU
+    ; stays enabled without -Ofast.
+    -O0                     ; DEBUG: no optimization -> every local is a real
+                            ; stack slot, strictly linear single-step
+    -g3                     ; DEBUG: maximum debug info incl. macro definitions
+    -fno-fast-math          ; keep float semantics bit-reproducible (WARN-5)
+    -funroll-loops          ; harmless at -O0 (no-op); kept for -Og/-O2 re-use
+    ; P2-10: -DCMSIS_DSP removed (no symbol in src/ uses CMSIS-DSP).
+    ; NOTE: -O0 costs ~2x flash and ~3-5x CPU time in the SD/DSP hot path —
+    ; THIS PROFILE IS NOT ACCEPTANCE-GRADE. Restore -O2 -g for timing runs.
+
+; --- Unflags ---------------------------------------------------------------
+; PlatformIO/CMSIS-Arm builds add -Os at the END of every compile line, which
+; wins over -O0 (last -O level wins). Remove it explicitly.
+build_unflags =
+    -Os
+
+
+; --- Libraries -------------------------------------------------------------
+; FatFs is bundled with the STM32CubeF4 HAL distribution used by framework=stm32cube,
+; so no external dependency is required. If your toolchain does not expose it,
+; uncomment one of these to pull a standalone copy:
+; lib_deps = 
+;     https://github.com/CHIBIRETOS/fatfs.git
+
+; --- Upload / monitor ------------------------------------------------------
+upload_protocol = stlink
+monitor_speed   = 115200
+; --- Отладка ---
+debug_tool = stlink
+debug_speed = 1000 ; опционально: 1000 кГц (1 МГц) — надёжнее для длинных проводов
+

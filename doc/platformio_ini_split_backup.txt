@@ -1,0 +1,163 @@
+; PlatformIO Project Configuration File
+;
+;   Build options: build flags, source filter
+;   Upload options: custom upload port, speed and extra flags
+;   Library options: dependencies, extra library storages
+;   Advanced options: extra scripting
+;
+; Please visit documentation for the other options and examples
+; https://docs.platformio.org/page/projectconf.html
+
+; ============================================================================
+; High-Speed Vibration Data Logger (V2) — WeAct STM32F405RGT6 mini core board
+; Framework: STM32 HAL via CubeMX-generated sources (NOT Arduino).
+; The CubeMX .ioc + generated code live in src/ ; FatFs ships with the HAL.
+; ============================================================================
+
+; ============================================================================
+; BUILD PROFILES — how to switch
+;
+;   pio run -e release                    -> -O2 build (ACCEPTANCE-GRADE)
+;   pio run -e release -t upload          -> build + flash production firmware
+;   pio run -e debug                      -> -O0 build (GDB single-stepping)
+;   pio run -e debug -t upload            -> build + flash debug firmware
+;   pio debug -e debug                    -> ST-LINK GDB session on debug build
+;   pio run -t clean                      -> cleans .pio/build for ALL envs
+;   pio run -v -e release  -> then inspect the arm-none-eabi-gcc command lines:
+;                            they must contain -O2 and MUST NOT contain -Os.
+;
+; Outputs are separated per env: .pio\build\release\firmware.elf/.bin
+;                                .pio\build\debug\firmware.elf/.bin
+; => switching profiles always recompiles src/ (and the HAL/CMSIS libs, which
+;    are also compiled per env). Expect ~1-2 min per env, NOT incremental.
+;
+; VS Code / PlatformIO调试: .vscode\launch.json is AUTO-GENERATED and pins
+; projectEnvName + firmware.elf path. After this split it still points at the
+; OLD path .pio\build\genericSTM32F405RG\. Fix it by either (a) setting
+; default_envs below and re-opening VS Code (PIO rewrites launch.json), or
+; (b) running  pio init --ide vscode .
+; ============================================================================
+
+[platformio]
+; Bare `pio run` (no -e) builds ONLY the envs listed here.
+; Keep exactly ONE line uncommented:
+;   debug   -> daily work, ST-LINK stepping, HIL DAC(PA5)->ADC(PA0/1/2) loopback
+;   release -> timing acceptance runs (SDIO throughput, TIM2 @1600 Hz jitter)
+default_envs = debug
+; default_envs = release
+
+
+; ============================================================================
+; BASE ENV — [env] is inherited automatically by EVERY [env:*] section below.
+; It holds the common platform/board/framework/upload/debug settings and the
+; critical build_unflags. It is not a buildable environment by itself.
+;
+; WHY build_unflags MUST LIVE HERE (doc/final_pre_flash_audit.md I5 / W-1):
+; the ststm32 build script appends its own "-Os" at the END of every compile
+; line, AFTER build_flags. GCC rule "last -O level wins" => the framework
+; silently overrode our level:
+;   ... -O2 -fno-fast-math -funroll-loops -mthumb -mcpu=cortex-m4 -Os ...
+; So without build_unflags = -Os, BOTH profiles would compile as -Os and every
+; measurement in doc/report.md would be invalid.
+; ============================================================================
+[env]
+platform        = ststm32
+board           = genericSTM32F405RG
+framework       = stm32cube
+
+; --- Common defines (see also the per-env duplication note below) ----------
+; -DHSE_VALUE=8000000 — WeAct core board carries an 8 MHz HSE crystal on
+; PH0-OSC_IN / PH1-OSC_OUT (doc/WEACT_F405_PINOUT.md §3: "HSE = 8 MHz on
+; PH0/PH1"; SDlogger405RG_Clean.ioc: RCC.HSE_VALUE=8000000, PLLM=4 PLLN=168
+; PLLP=2 -> SYSCLK 168 MHz). Drop it and stm32f4xx.h falls back to 25 MHz
+; (src/system_stm32f4xx.c: "#define HSE_VALUE ((uint32_t)25000000)") ->
+; SystemCoreClock, SDIO bypass-clock divider and TIM2 prescaler math all wrong.
+build_flags =
+    -DUSE_HAL_DRIVER
+    -DSTM32F405xx
+    -DHSE_VALUE=8000000
+
+; --- Unflags: mandatory in both profiles -----------------------------------
+build_unflags =
+    -Os
+
+; --- Upload / monitor / debugger (identical for both profiles) -------------
+upload_protocol = stlink
+monitor_speed   = 115200
+debug_tool      = stlink
+debug_speed     = 1000   ; kHz (1 MHz) — more robust on long ST-LINK wires
+
+; --- Libraries --------------------------------------------------------------
+; FatFs (R0.12c) ships inside the STM32CubeF4 distribution used by
+; framework=stm32cube; the project keeps its own copy in src/ff.c + src/ff.h,
+; so no external dependency is required. If your toolchain does not expose it,
+; uncomment one of these to pull a standalone copy:
+; lib_deps =
+;     https://github.com/CHIBIRETOS/fatfs.git
+
+
+; ============================================================================
+; [env:release] extends = env — PRODUCTION / ACCEPTANCE profile (-O2)
+; Use this for every real-world measurement: SDIO 4-bit throughput, TIM2
+; @1600 Hz ISR jitter, calibration + CRC32 cost, full logging session duration.
+; -O0 numbers are NOT transferable: -O0 costs ~2x flash and ~3-5x CPU time in
+; the SD/DSP hot path (see the warning block at the bottom of this file).
+; ============================================================================
+[env:release]
+extends = env
+
+build_flags =
+    ; --- common defines (repeated on purpose: a child's build_flags replaces
+    ;     the inherited value rather than appending to it, so the defines MUST
+    ;     be present here. Verify with: pio run -v -e release) ---
+    -DUSE_HAL_DRIVER
+    -DSTM32F405xx
+    -DHSE_VALUE=8000000
+
+    ; --- optimization / semantics -------------------------------------------
+    -O2                     ; ACCEPTANCE-GRADE level (audit item I2, P2-10)
+    -g                      ; debug symbols in .elf only; .bin/.text unchanged,
+                            ; so addr2line / objdump on a field failure still works
+    -fno-fast-math          ; audit WARN-5: float gain + offsets in sd_writer.h
+                            ; must stay bit-reproducible across compiler versions
+    -funroll-loops          ; hot loops: CRC32 (src/ff.c), chunk packing, calibration
+    ; P2-10: -DCMSIS_DSP stays REMOVED (no symbol in src/ uses CMSIS-DSP).
+    ; Deliberately NOT used here:
+    ;   -Ofast / -ffast-math  -> implies -ffast-math: re-associates float math,
+    ;                            breaks reproducibility of the calibration path.
+    ;   -flto                  -> would inline the ISR path and invalidate the
+    ;                            per-function cycle budget used in the audits.
+    ; ststm32 still supplies -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=softfp,
+    ; so the single-precision VFPv4 FPU stays enabled without -Ofast.
+
+build_unflags =
+    -Os
+
+
+; ============================================================================
+; [env:debug] extends = env — STEP-BY-STEP DEBUG profile (-O0 -g3)
+; Locals (prealloc_ok, tr, ...) must be real stack slots, otherwise GDB prints
+; "<optimized out>" and single-stepping jumps around the function.
+; ============================================================================
+[env:debug]
+extends = env
+
+build_flags =
+    ; --- common defines (repeated, see the note in [env:release]) ---
+    -DUSE_HAL_DRIVER
+    -DSTM32F405xx
+    -DHSE_VALUE=8000000
+
+    ; --- optimization / debug info ------------------------------------------
+    -O0                     ; every local is a real stack slot, linear stepping
+    -g3                     ; maximum debug info, including macro definitions
+    -fno-fast-math          ; float semantics IDENTICAL to the release build,
+                            ; so a bug seen here is the same bug seen at -O2
+    -funroll-loops          ; no-op at -O0; kept so both profiles share one flag set
+
+build_unflags =
+    -Os
+
+; WARNING (do not quote timing numbers from this profile):
+;   -O0 => ~2x flash and ~3-5x CPU time in the SD/DSP hot path.
+;   THIS PROFILE IS NOT ACCEPTANCE-GRADE — run timing tests with -e release.
