@@ -63,8 +63,9 @@ DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
          * on DATAEND/CTIMEOUT/DTIMEOUT, so 1000 ms covers card-internal GC (SD spec
          * erase/write stall, which can reach ~1 s independently of the bus clock -
          * the stall happens inside the card, not on the wires (P3-2 raised the
-         * transfer clock from 2.667 MHz to 12 MHz; that does not change this
-         * bound). A single op of
+         * transfer clock 2.667 MHz -> 12 MHz, then back to 8 MHz (src/sdio.c);
+          * that does not change this bound).
+         * A single op of
          * 1000 ms < 4.095 s and HAL_IWDG_Refresh below feeds the dog after EVERY op,
          * so consecutive ops can never span a reset. */
         if (HAL_SD_ReadBlocks(&hsd, (uint8_t *)buff, sector, count, 1000U) != HAL_OK) {
@@ -121,10 +122,10 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
      * sectors per cluster on a 32 GB card) and on cluster alignment, because
      * ff.c clips a direct multi-sector write at the cluster boundary. Verify
      * with DWT_CYCCNT before quoting the duty again.
-     * Transfer term at the CURRENT clock (P3-2: SDIO_CK = 48 MHz/(2+2) = 12 MHz,
-     * 1-bit, src/sdio.c) = 12294*8/12e6 = 8.2 ms per chunk; at the Milestone-1
-     * clock (ClockDiv = 16 -> 2.667 MHz) it was 36.9 ms, i.e. the transfer part
-     * is 4.5x cheaper. Against 1280 ms needed to fill the next chunk at 1600 Hz
+     * Transfer term at the CURRENT clock (P3-2 rollback: SDIO_CK = 48/(4+2) = 8 MHz,
+     * 1-bit, src/sdio.c) = 12294*8/8e6 = 12.3 ms per chunk; at the Milestone-3
+     * clock (ClockDiv = 2 -> 12 MHz) it was 8.2 ms and at Milestone-1 (ClockDiv
+     * = 16 -> 2.667 MHz) 36.9 ms. Against 1280 ms needed to fill a chunk at 1600 Hz
      * the consumer still runs far ahead of the producer => no arena overrun, no
      * dropped samples.
      * P0-3's duty arithmetic (7 % -> 27 %) was correct; only its conclusion was.

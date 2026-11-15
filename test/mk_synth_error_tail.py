@@ -20,6 +20,14 @@ Three shapes matter for parser_vibl.py and for the firmware shutdown path:
    f_truncate(vibl_data_end) inside vibl_close(), so the file is exactly
    header + 4 good chunks + trailer, and the trailer CRC must MATCH the payload.
 
+4. SYNTH_CORRUPT_TRAILER.VIB - the Milestone-3 (12 MHz) bench artefact that
+   caused the ClockDiv rollback to 8 MHz: 102 chunks, no gaps, exact size
+   (256 + 102*12294 + 16 = 1 254 260 B), but one bit flipped in the 16 B
+   trailer's CRC field (a setup/hold violation on D0 during the last write).
+   parser_vibl.py must keep every chunk as valid and downgrade the trailer to
+   "⚠️ Trailer CRC mismatch (likely corrupted during power loss / SD error)" -
+   never a fatal "MISMATCH" verdict on the whole file.
+
 Usage: python test/mk_synth_error_tail.py [output_dir]
 """
 import os
@@ -115,6 +123,30 @@ def build(outdir):
     print('3) %-32s %d B  4 chunks + trailer (f_truncate at vibl_data_end)'
           % (p3, os.path.getsize(p3)))
     print('   expected trailer CRC32 : %08X' % (file_crc ^ 0xFFFFFFFF))
+
+    # 4. Milestone-3 bench artefact: whole file fine, TRAILER write corrupted -----
+    #    102 chunks landed correctly (256 + 102*12294 + 16 = 1 254 260 B, no gaps),
+    #    but the final 16 B (the trailer) was damaged on the bus at ClockDiv = 2
+    #    (12 MHz). Modelled as ONE flipped bit in the trailer's file_crc32 field -
+    #    a setup/hold violation on D0 is a single-bit event. parser_vibl.py must
+    #    keep all 102 chunks as valid data and report the trailer as a WARNING.
+    nchunks = 102
+    body = b''.join(chunk(i) for i in range(nchunks))
+    file_crc = 0xFFFFFFFF
+    for i in range(nchunks):
+        file_crc = crc32_update(file_crc, chunk(i))
+    good_crc = file_crc ^ 0xFFFFFFFF
+    bad_crc = good_crc ^ 0x00000001          # 1 bit corrupted by the bus error
+    p4 = os.path.join(outdir, 'SYNTH_CORRUPT_TRAILER.VIB')
+    with open(p4, 'wb') as f:
+        f.write(header(nchunks, start_ts, closed=True))
+        f.write(body)
+        f.write(struct.pack('<QII', start_ts + nchunks * 1280,
+                            nchunks * CHUNK_SAMPLES, bad_crc))
+    print('4) %-32s %d B  %d chunks + CORRUPTED trailer (1 bit of file_crc32)'
+          % (p4, os.path.getsize(p4), nchunks))
+    print('   intact trailer CRC32   : %08X' % good_crc)
+    print('   stored (corrupt) CRC32 : %08X  -> parser warns, does not fail' % bad_crc)
 
 
 if __name__ == '__main__':
