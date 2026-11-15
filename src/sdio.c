@@ -44,7 +44,36 @@ void MX_SDIO_SD_Init(void)
   hsd.Init.ClockPowerSave = SDIO_CLOCK_POWER_SAVE_DISABLE;
   hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
   hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
-  hsd.Init.ClockDiv = 16;
+  /* P3-2 (Milestone 3): ClockDiv 16 -> 2.
+   * SDMMC_CK = SDMMCCLK / (ClockDiv + 2) = 48 MHz / 4 = 12 MHz, with SDMMCCLK =
+   * PLLQ = 48 MHz (SDlogger405RG_Clean.ioc: RCC.PLLQ = 7,
+   * RCC.PLLQCLKFreq_Value = 48000000). The bus STAYS 1-bit: hsd.Init.BusWide =
+   * SDIO_BUS_WIDE_1B just above, and disk_initialize() deliberately keeps the
+   * HAL_SD_ConfigWideBusOperation(4B) call removed (src/diskio.c).
+   *
+   * Why 12 MHz is safe here (cited, not assumed):
+   *  - the HAL's own ceiling for data transfer is 25 MHz - stm32f4xx_ll_sdmmc.h
+   *    :726-727 "SDIO Data Transfer Frequency (25MHz max)", with the default
+   *    SDIO_TRANSFER_CLK_DIV = 0x00 = 24 MHz; 12 MHz is a 2x margin to that, and
+   *    12 MHz is also the SD 1.x default-speed timing limit (0-25 MHz).
+   *  - card identification is unaffected: HAL_SD_InitCard() first re-inits the
+   *    peripheral at 400 kHz (SDIO_INIT_CLK_DIV = 0x76, stm32f4xx_hal_sd.c:414,
+   *    applied at :417) and only at the end of SD_InitCard() applies hsd->Init,
+   *    i.e. this ClockDiv (stm32f4xx_hal_sd.c:2752).
+   *  - the pairing with the .ioc is kept: SDIO.ClockDiv=2 there, otherwise a
+   *    CubeMX regeneration would silently write ClockDiv back to the old value
+   *    (the Init.* assignments are OUTSIDE the USER CODE blocks).
+   *
+   * Effect: payload ceiling 12 Mbit/s = 1.5 MB/s vs 9 600 B/s needed -> 156x
+   * headroom (was 34.7x). Pure transfer time of one 12 294 B chunk drops from
+   * 12294*8/2.6667e6 = 36.9 ms to 12294*8/12e6 = 8.2 ms (4.5x). Shorter bus
+   * occupancy also shrinks the window in which the card's internal
+   * program/erase stall (GC) can collide with the next command.
+   * UNCERTAIN (hardware): 12 MHz on this board's soldered 4-bit routing
+   * (doc/WEACT_F405_PINOUT.md sec.1: PC8..PC11, PC12=CK, PD2=CMD) has not been
+   * probed with a logic analyser. Step-back ladder if CRC/data errors appear:
+   * ClockDiv 4 (8 MHz), then 16 (2.667 MHz, the Milestone-1 value). */
+  hsd.Init.ClockDiv = 2;
   if (HAL_SD_Init(&hsd) != HAL_OK)
   {
     Error_Handler();

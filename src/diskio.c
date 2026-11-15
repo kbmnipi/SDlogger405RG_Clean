@@ -61,7 +61,10 @@ DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
          * (iwdg.c: T_IWDG = 4095*32/32000 = 4.095 s), 1000 ms is the safe margin for
          * first-touch FAT/cluster writes on a fresh card: HAL_SD_ReadBlocks returns
          * on DATAEND/CTIMEOUT/DTIMEOUT, so 1000 ms covers card-internal GC (SD spec
-         * erase/write stall can reach ~1 s on 1-bit @2.6 MHz). A single op of
+         * erase/write stall, which can reach ~1 s independently of the bus clock -
+         * the stall happens inside the card, not on the wires (P3-2 raised the
+         * transfer clock from 2.667 MHz to 12 MHz; that does not change this
+         * bound). A single op of
          * 1000 ms < 4.095 s and HAL_IWDG_Refresh below feeds the dog after EVERY op,
          * so consecutive ops can never span a reset. */
         if (HAL_SD_ReadBlocks(&hsd, (uint8_t *)buff, sector, count, 1000U) != HAL_OK) {
@@ -112,10 +115,18 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
      * identical for all of them.
      *
      * Cost is bounded and hidden behind acquisition, so it is affordable:
-     * 25 disk_write calls per 12294 B chunk x 10 ms = 250 ms + 36.9 ms of transfer
-     * (SDIO_CK = 48 MHz/(16+2) = 2.667 MHz, 1-bit) = ~287 ms per chunk, against
-     * 1280 ms needed to fill the next chunk at 1600 Hz => duty 22.4 %, consumer
-     * still 4.5x faster than producer => no arena overrun, no dropped samples.
+     * 10 ms per disk_write call, and the transfer term. UNCERTAIN (needs DWT):
+     * this comment's original figure counted "25 disk_write calls per 12294 B
+     * chunk"; the real call count depends on fs->csize (4 KiB clusters = 8
+     * sectors per cluster on a 32 GB card) and on cluster alignment, because
+     * ff.c clips a direct multi-sector write at the cluster boundary. Verify
+     * with DWT_CYCCNT before quoting the duty again.
+     * Transfer term at the CURRENT clock (P3-2: SDIO_CK = 48 MHz/(2+2) = 12 MHz,
+     * 1-bit, src/sdio.c) = 12294*8/12e6 = 8.2 ms per chunk; at the Milestone-1
+     * clock (ClockDiv = 16 -> 2.667 MHz) it was 36.9 ms, i.e. the transfer part
+     * is 4.5x cheaper. Against 1280 ms needed to fill the next chunk at 1600 Hz
+     * the consumer still runs far ahead of the producer => no arena overrun, no
+     * dropped samples.
      * P0-3's duty arithmetic (7 % -> 27 %) was correct; only its conclusion was.
      * HAL_IWDG_Refresh() below feeds the dog after every call (T_IWDG = 4.095 s,
      * iwdg.c:45), so 1000 ms timeout + 3 retries (sd_writer.c:88) = 3.000 s stays

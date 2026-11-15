@@ -92,9 +92,10 @@ void SystemClock_Config(void);
 /* P1-8 - graceful shutdown after an SD write error.
  *
  * WHY THIS EXISTS: every chunk is committed by f_sync() inside
- * vibl_write_chunk() (sd_writer.c:396), so when the card stalls the samples
+ * vibl_write_chunk() (sd_writer.c:420), so when the card stalls the samples
  * already on the card are safe. What is at risk is the END of the file: without
- * vibl_close() the session leaves behind the 42 MiB preallocated tail (P1-7),
+ * vibl_close() the session leaves behind the preallocated tail (P1-7 stretch
+ * mode: up to 42 MiB; P3-1 expand mode: no tail at all),
  * no trailer (end_ts / total_records / file_crc32), and the few bytes of the
  * chunk that died mid-write still punched into the stream. The old behaviour
  * (a bare hil3_error_loop(5) right at the failing write) abandoned the file in

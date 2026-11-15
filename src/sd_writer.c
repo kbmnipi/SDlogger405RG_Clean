@@ -25,10 +25,21 @@ static uint32_t      total_records     = 0u;
 static uint32_t      chunk_count       = 0u;
 static uint32_t      total_dropped     = 0u;
 static volatile int  overflow_latched  = 0;
-/* P1-7 companion: real end of written payload. With preallocation the FatFs
- * object size (f_size) is the PREALLOCATED length, so it can no longer be used
- * to locate the trailer — see vibl_close(). */
+/* P1-7 companion: real end of written payload. It is the authority for where
+ * the trailer goes, whichever way the session was preallocated:
+ *   - VIBL_PREALLOC_STRETCH (legacy f_lseek stretch): f_size() is the
+ *     PREALLOCATED length, so only vibl_data_end can locate the trailer;
+ *   - VIBL_PREALLOC_EXPAND (P3-1, f_expand opt=0): f_write keeps
+ *     objsize == max(fptr, objsize) (ff.c:3636), so the FatFs object size
+ *     already equals the bytes written and vibl_data_end == f_size(). */
 static uint32_t      vibl_data_end     = 0u;
+
+/* P3-1 (Milestone 3): which preallocation strategy this session ended up with.
+ * It decides whether vibl_close() has a ~42 MiB tail to release or nothing. */
+#define VIBL_PREALLOC_NONE      0u   /* nothing attempted / no session opened   */
+#define VIBL_PREALLOC_EXPAND    1u   /* f_expand(opt=0): contiguous, size==data */
+#define VIBL_PREALLOC_STRETCH   2u   /* f_lseek stretch: needs the big truncate */
+static uint8_t       vibl_prealloc_mode = VIBL_PREALLOC_NONE;
 
 /* Running CRC-32 state (un-finalized). Starts at 0xFFFFFFFF and is finalized
  * with ^0xFFFFFFFF only when the trailer value is produced.               */
@@ -92,6 +103,7 @@ static volatile int     vibl_dbg_attempts = 0;
 static volatile FRESULT vibl_dbg_open_fr  = FR_OK;  /* FIX-D: last f_open() result */
 static volatile int     vibl_dbg_cd_pa8   = -1;     /* FIX-D: 1 = PA8 HIGH = card inserted */
 static volatile int     vibl_dbg_sd_error = 0;      /* P1-8: 1 = a chunk was abandoned */
+static volatile FRESULT vibl_dbg_expand_fr = FR_OK; /* P3-1: f_expand() result; 7 = FR_DENIED -> stretch fallback */
 
 /* Write `len` bytes to the open file, looping in <=64 KiB f_write calls.
  *
@@ -233,6 +245,26 @@ static uint64_t vibl_rtc_ms(void)
 /* Public API                                                                 */
 /* -------------------------------------------------------------------------- */
 
+/* One session's preallocation target, single source of truth for BOTH the
+ * f_expand() attempt and the f_lseek() fallback:
+ *   256 B header + 3600 chunks x (chunk_hdr 6 + 2048 x 6) = 256 + 44 258 400
+ * = 44 258 656 B (42.2 MiB) = 3600 x 1.28 s = 4608 s = 76.8 min of payload
+ * (a real hour needs 2813 chunks). Clamped to 64 MiB so a small card is never
+ * stretched past its capacity. On a 32 GB FAT32 card with 4 KiB clusters this
+ * span is 44 258 656 / 4096 = 10 806 clusters. */
+static FSIZE_t vibl_prealloc_target(void)
+{
+    const FSIZE_t chunk_bytes = (FSIZE_t)(sizeof(vibl_chunk_hdr_t)
+                                + (VIBL_SAMPLES_PER_CHUNK * VIBL_BYTES_PER_SAMPLE));
+    FSIZE_t expected = (FSIZE_t)VIBL_HEADER_SIZE + ((FSIZE_t)3600u * chunk_bytes);
+    const FSIZE_t cap = (FSIZE_t)64u * 1024u * 1024u;   /* cap for small cards */
+
+    if (expected > cap) {
+        expected = cap;
+    }
+    return expected;
+}
+
 int vibl_open(const char *filename, uint8_t sensor_id, uint8_t range_g, uint16_t gain)
 {
     if (filename == NULL) {
@@ -275,6 +307,7 @@ int vibl_open(const char *filename, uint8_t sensor_id, uint8_t range_g, uint16_t
     total_dropped    = 0u;
     overflow_latched = 0;
     vibl_data_end    = 0u;
+    vibl_prealloc_mode = VIBL_PREALLOC_NONE;
     vibl_file_crc    = 0xFFFFFFFFu;            /* running (un-finalized) state */
 
     FRESULT fr = f_open(&vibl_fil, filename, FA_CREATE_ALWAYS | FA_WRITE);
@@ -295,6 +328,34 @@ int vibl_open(const char *filename, uint8_t sensor_id, uint8_t range_g, uint16_t
     vibl_dbg_cd_pa8 = (HAL_GPIO_ReadPin(SD_DETECT_GPIO_Port, SD_DETECT_Pin)
                        == GPIO_PIN_SET) ? 1 : 0;
 
+    /* ---- P3-1: contiguous preallocation attempt, BEFORE any byte is written.
+     * The position is not cosmetic: f_expand() rejects a file whose objsize is
+     * not zero (ff.c:5153 `if (fsz == 0 || fp->obj.objsize != 0 || !(fp->flag &
+     * FA_WRITE)) LEAVE_FF(fs, FR_DENIED);`), and the header write below makes
+     * objsize 256 - called after it, f_expand could never succeed.
+     *
+     * opt = 0 ("Find and prepare") is used deliberately. opt = 1 ("Find and
+     * allocate") links the whole run into the FAT immediately AND sets
+     * fp->obj.objsize = fsz (ff.c:5208), which puts the 42 MiB tail right back
+     * and re-requires the ~10 800-cluster remove_chain() at close - exactly what
+     * this patch exists to remove. opt = 0 only proves that a run of `tcl` free
+     * clusters exists and parks fs->last_clst just before it (ff.c:5199, :5205);
+     * create_chain() then allocates forward from that bias (ff.c:1362,
+     * :1400-1414, :1419), so every cluster of the session is the next one in the
+     * verified run while objsize stays equal to the bytes actually written.
+     *
+     * FR_DENIED (no contiguous run of this size, ff.c:5189) is NOT fatal: the
+     * session falls back to the legacy f_lseek stretch below. Inspect
+     * vibl_dbg_expand_fr and vibl_prealloc_mode in the watch window to see which
+     * mode a real card produced. */
+    {
+        FRESULT fer = f_expand(&vibl_fil, vibl_prealloc_target(), 0);
+
+        vibl_dbg_expand_fr = fer;
+        vibl_prealloc_mode = (fer == FR_OK) ? VIBL_PREALLOC_EXPAND
+                                            : VIBL_PREALLOC_STRETCH;
+    }
+
     if (vibl_write_all((const uint8_t *)&vibl_hdr, sizeof(vibl_hdr)) != VIBL_OK) {
         /* STOP HERE: inspect vibl_dbg_last_fr / _last_bw / _attempts /
          * _open_fr / _cd_pa8 and hsd.ErrorCode before the file is closed -
@@ -312,67 +373,86 @@ int vibl_open(const char *filename, uint8_t sensor_id, uint8_t range_g, uint16_t
         return VIBL_ERR_SYNC;
     }
 
-    /* ---- P1-7 (audit WARN/§6): preallocate the whole session at open -------
-     * Without this, every cluster boundary inside f_write() calls
-     * create_chain() (ff.c:3652) -> get_fat + 2x put_fat (FAT write-back
-     * window) + FSINFO dirty, i.e. 1-2 extra 512 B SD writes with metadata
-     * traffic per cluster. A single forced-stretch seek at open walks the
-     * chain once (ff.c:4113 create_chain in FA_WRITE mode), so steady-state
-     * recording only follows an already-linked chain.
+    /* ---- P3-1 (replaces the P1-7 stretch as the PRIMARY path) ------------
+     * Two preallocation modes exist now; whichever one was chosen is recorded
+     * in vibl_prealloc_mode by the attempt above.
      *
-     * Chunk = chunk_hdr(6) + 2048*6 = 12294 B; 1.28 s per chunk.
-     * Preallocation target = 256 + 3600*12294 = 44 258 656 B (~42.2 MiB),
-     * clamped to 64 MiB, which is 4608 s = 76.8 min of payload.
-     * NOTE: the audit labels this "1 hour"; 3600 *chunks* is 76.8 min (a real
-     * hour needs 2813 chunks). The number is kept, only the label is fixed.
+     * EXPAND mode - f_expand(&vibl_fil, target, opt = 0). objsize is left alone,
+     * so the file is always exactly as long as its data: a power cut or an SD
+     * error leaves no 42 MiB tail allocated on the card, and close has nothing
+     * to release. Clusters are allocated lazily but contiguously, because
+     * f_expand parked fs->last_clst at the start of a run it verified to be free
+     * (ff.c:5179-5190, :5199, :5205) and create_chain allocates forward from
+     * there (ff.c:1362, :1400-1414, :1419).
+     * Cost per cluster boundary (4 KiB clusters, ~3 boundaries per 12 294 B
+     * chunk): get_fat + 2x put_fat inside the cached FAT window - one 512 B FAT
+     * sector flush per ~64 allocations (128 FAT32 entries per sector) - plus
+     * FSINFO dirtied, so one extra 512 B write per f_sync (ff.c:954-966):
+     * ~4 % metadata per chunk. That is the price for removing the close-time
+     * remove_chain() storm. Contiguity is best-effort (the run is not reserved);
+     * fragmentation would cost nothing here anyway, because parser_vibl.py walks
+     * chunks, not clusters.
      *
-     * Cost at close: vibl_close() releases the never-written tail with
-     * f_truncate() -> remove_chain() (ff.c:4488-4513). With 4 KiB clusters
-     * (32 GB card) that is ~10 300 put_fat() calls, most of them hitting the
-     * same FAT sector, so ~0.3-0.5 s - not a 42 MB write storm, but long
-     * enough that main.c stops TIM2 before calling vibl_close().
+     * STRETCH mode - the legacy P1-7 path, kept as the FALLBACK for the case
+     * where no contiguous run of this size exists (f_expand -> FR_DENIED,
+     * ff.c:5189) or the card/FS refuses it. A single forced-stretch seek pre-links
+     * the chain (ff.c:4113) and steady-state recording only follows it (ff.c:1369
+     * returns the existing next cluster, no put_fat), but the tail has to be
+     * released at close: with 4 KiB clusters on a 32 GB card that is ~10 800
+     * put_fat calls, most hitting the same FAT sector, i.e. ~0.3-0.5 s.
      *
-     * DEVIATION: on failure this patch closes + unlinks the file and returns
-     * VIBL_ERR_OPEN instead of the spec's "res = VIBL_ERR_WRITE; goto fail;",
-     * because (a) sd_writer.c has no `res`/`fail:` label, and (b) the audit
-     * itself flags an unbounded preallocation as unsafe (old audit WARN-4):
-     * with FA_CREATE_ALWAYS the stretched chain survives f_close() when the
-     * extension partially failed (ff.c:4115 only clips the size on a full
-     * disk), so a bare f_close() would strand up to 42 MiB per retry.
-     * f_unlink() (ff.h:255) releases the whole chain via remove_chain().
+     * Target (both modes, from vibl_prealloc_target()): chunk = chunk_hdr(6) +
+     * 2048*6 = 12 294 B, 1.28 s per chunk; 256 + 3600*12294 = 44 258 656 B
+     * (~42.2 MiB) = 4608 s = 76.8 min of payload. NOTE: the audit labels this
+     * "1 hour"; 3600 *chunks* is 76.8 min (a real hour needs 2813 chunks).
      *
-     * The tail is never zero-filled, so there is no write storm at open:
-     * FatFs writes sectors only when f_write() reaches them. */
+     * Geometry note kept from P1-7: the payload starts at VIBL_HEADER_SIZE = 256
+     * (sd_writer.h:29 _Static_assert), NOT 512 - the old patch text assumed a
+     * 512-byte header sector that this tree does not have, and seeking to 512
+     * would punch a 256-byte zero hole between header and payload
+     * (parser_vibl.py parses from pos = 256).
+     *
+     * DEVIATION kept from P1-7: on failure the file is closed AND unlinked and
+     * VIBL_ERR_OPEN is returned (instead of the spec's "res = VIBL_ERR_WRITE;
+     * goto fail;"), because a half-failed stretch survives f_close() (ff.c:4115
+     * only clips the size on a full disk) and a bare close would strand up to
+     * 42 MiB per retry; f_unlink() (ff.h:255) releases the chain via
+     * remove_chain(). The tail is never zero-filled, so preallocation costs no
+     * data write storm at open either way. */
     {
-        const FSIZE_t chunk_bytes = (FSIZE_t)(sizeof(vibl_chunk_hdr_t)
-                                    + (VIBL_SAMPLES_PER_CHUNK * VIBL_BYTES_PER_SAMPLE));
-        /* DEVIATION (required): the patch text assumed the old tree's 512-byte
-         * header sector ("after the existing f_lseek(&vibl_fil, 512u)"). This
-         * tree has NO such line and its header is exactly VIBL_HEADER_SIZE = 256
-         * (sd_writer.h:29, _Static_assert), with the first chunk at offset 256 —
-         * parser_vibl.py:39 parses from pos=256. Seeking back to 512 would have
-         * punched a 256-byte zero hole between header and payload. */
-        FSIZE_t expected = (FSIZE_t)VIBL_HEADER_SIZE
-                           + ((FSIZE_t)3600u * chunk_bytes);
-        const  FSIZE_t cap = (FSIZE_t)64u * 1024u * 1024u;   /* cap for small cards */
-        int    prealloc_ok = 1;
+        int prealloc_ok = 1;
 
-        if (expected > cap) {
-            expected = cap;
-        }
-        if (f_lseek(&vibl_fil, expected) != FR_OK) {   /* stretch the chain once */
-            prealloc_ok = 0;
-        } else if (f_lseek(&vibl_fil, (FSIZE_t)VIBL_HEADER_SIZE) != FR_OK) {
-            prealloc_ok = 0;                           /* back to payload start */
-        } else if (f_tell(&vibl_fil) != (FSIZE_t)VIBL_HEADER_SIZE) {
-            prealloc_ok = 0;                           /* size clipped (disk full) */
+        if (vibl_prealloc_mode == VIBL_PREALLOC_EXPAND) {
+            /* Do NOT seek past EOF in expand mode: f_lseek() in FA_WRITE mode
+             * stretches the chain and sets objsize = fptr (ff.c:4113,
+             * :4134-4136), which would re-create the very tail this mode exists
+             * to avoid. Verify the geometry only - the header must have landed
+             * at 256 and nothing else has been written yet. */
+            if (f_tell(&vibl_fil) != (FSIZE_t)VIBL_HEADER_SIZE) {
+                prealloc_ok = 0;
+            } else {
+                /* Expand accepted: payload starts at 256, clusters follow the
+                 * verified contiguous run as they are written. */
+            }
         } else {
-            /* Preallocation accepted: payload starts at 256, chain pre-linked. */
+            FSIZE_t expected = vibl_prealloc_target();
+
+            vibl_prealloc_mode = VIBL_PREALLOC_STRETCH;
+            if (f_lseek(&vibl_fil, expected) != FR_OK) {   /* stretch the chain once */
+                prealloc_ok = 0;
+            } else if (f_lseek(&vibl_fil, (FSIZE_t)VIBL_HEADER_SIZE) != FR_OK) {
+                prealloc_ok = 0;                           /* back to payload start */
+            } else if (f_tell(&vibl_fil) != (FSIZE_t)VIBL_HEADER_SIZE) {
+                prealloc_ok = 0;                           /* size clipped (disk full) */
+            } else {
+                /* Stretch accepted: payload starts at 256, chain pre-linked. */
+            }
         }
 
         if (prealloc_ok == 0) {
             f_close(&vibl_fil);
             vibl_active = 0;
+            vibl_prealloc_mode = VIBL_PREALLOC_NONE;
             (void)f_unlink(filename);
             return VIBL_ERR_OPEN;
         }
@@ -497,17 +577,28 @@ int vibl_close(void)
 
     /* 2) Append the trailer at the end of the payload.
      *
-     * P1-7 companion (required): with preallocation, f_size() is the
-     * PREALLOCATED length (42 MB), not the data end, so the old
-     * "lseek(f_size())" would have written the trailer ~42 MB deep and made it
-     * invisible to parser_vibl.py (which walks chunks forward from 256).
-     * Order is chosen for power-loss atomicity:
-     *   a) seek to the payload end and f_truncate() there — this releases the
-     *      never-written tail of the preallocated chain (ff.c:4488-4513
-     *      remove_chain) and sets objsize to the real data end;
-     *   b) write the trailer, which then lands exactly at EOF.
-     * A power loss between (a) and (b) leaves size == data end and no trailer,
-     * i.e. the parser's existing "power loss" path — never a stranded trailer. */
+     * The seek is required in BOTH preallocation modes: step 1 left the file
+     * pointer at 55 (record_count + header_crc), so without
+     * f_lseek(vibl_data_end) the trailer would land on top of the header.
+     *
+     * f_truncate() is kept in BOTH modes on purpose - but in the primary (P3-1
+     * EXPAND) mode it is no longer the expensive operation it used to be:
+     *   - EXPAND: objsize already equals vibl_data_end for a clean session, so
+     *     f_truncate() does nothing at all - its entire body is guarded by
+     *     `if (fp->fptr < fp->obj.objsize)` (ff.c:4488), i.e. zero I/O.
+     *   - EXPAND with an abandoned chunk (the P1-8 SD-error path): fptr <
+     *     objsize there, so it releases only the dead chunk's clusters
+     *     (<= 12 294 B = <= 3 clusters at 4 KiB) instead of ~10 800.
+     *   - STRETCH (fallback): this is the ~10 800-cluster remove_chain()
+     *     (ff.c:4488-4513) of ~0.3-0.5 s, which is why main.c stops TIM2 before
+     *     its own vibl_close().
+     * Either way objsize ends up == vibl_data_end, so the trailer written next
+     * lands exactly at EOF. That invariant is what parser_vibl.py's
+     * trailer_candidate() needs (it requires len(data) - pos == 16): any stale
+     * bytes after the trailer make the trailer invisible to the parser.
+     * A power loss between the truncate and the trailer write leaves
+     * size == data end and no trailer, i.e. the parser's
+     * "No trailer found (power loss/error)" path - never a stranded trailer. */
     if (vibl_data_end == 0u) {
         vibl_data_end = VIBL_HEADER_SIZE;    /* zero-chunk session */
     }

@@ -16,7 +16,7 @@
 #define _USE_FIND		0	/* Disable filtered directory read */
 #define _USE_MKFS		0	/* 0: No formatting support */
 #define _USE_FASTSEEK	0	/* Disable fast-seek linkmap */
-#define _USE_EXPAND		0	/* Disable f_expand() */
+#define _USE_EXPAND		1	/* Enable f_expand() - used by vibl_open() (P3-1) */
 #define _USE_CHMOD		0	/* Disable attribute manipulation */
 #define _USE_LABEL		1	/* Enable volume label functions */
 #define _USE_FORWARD	0	/* Disable f_forward() */
