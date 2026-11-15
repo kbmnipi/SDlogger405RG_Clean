@@ -39,7 +39,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* P1-8 (graceful shutdown on SD error): how many times the main loop re-inits
+ * the SDMMC bus with HAL_SD_Init() before it gives up and closes the file for
+ * good. Each attempt is bracketed by a card-detect gate and HAL_IWDG_Refresh(),
+ * because HAL_SD_Init() feeds the watchdog nowhere internally
+ * (doc/final_pre_flash_audit.md W-5; the SDMMC busy-waits use SDIO_CMDTIMEOUT,
+ * which ll_sdmmc.c:1330 treats as milliseconds). T_IWDG = 4.095 s (iwdg.c P0-4). */
+#define SD_RECOVERY_ATTEMPTS 3u
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -83,7 +89,83 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* P1-8 - graceful shutdown after an SD write error.
+ *
+ * WHY THIS EXISTS: every chunk is committed by f_sync() inside
+ * vibl_write_chunk() (sd_writer.c:396), so when the card stalls the samples
+ * already on the card are safe. What is at risk is the END of the file: without
+ * vibl_close() the session leaves behind the 42 MiB preallocated tail (P1-7),
+ * no trailer (end_ts / total_records / file_crc32), and the few bytes of the
+ * chunk that died mid-write still punched into the stream. The old behaviour
+ * (a bare hil3_error_loop(5) right at the failing write) abandoned the file in
+ * exactly that state, i.e. a recoverable stall looked like a power cut.
+ *
+ * This path preserves the data instead:
+ *   1. re-init the bus (up to SD_RECOVERY_ATTEMPTS x HAL_SD_Init) - NOT a
+ *      re-mount: f_mount(&fs,"0:",1) would run fs->id = ++Fsid (ff.c:3192) while
+ *      validate() demands obj->id == obj->fs->id (ff.c:3224), which would mark
+ *      the already open FIL invalid and make the close impossible. HAL_SD_Init
+ *      alone is sufficient: validate() consults only disk_status() (ff.c:3236),
+ *      which is the PA8 card-detect pin, and fs->fs_type stays non-zero.
+ *   2. vibl_close(): seek back to vibl_data_end (advanced ONLY by successful
+ *      chunks, sd_writer.c:407) + f_truncate() -> the abandoned partial chunk
+ *      is cut away, then the trailer lands at the true EOF with a CRC that
+ *      matches the surviving payload byte-for-byte (parser_vibl.py must then
+ *      print "File CRC32: ... MATCH", verified by test/SYNTH_SDERROR_CLOSED.VIB).
+ *   3. stop the 1600 Hz sampler and park in the error-blink loop. The session
+ *      is NOT resumed on purpose: the stream offset after a half-written chunk
+ *      can no longer be guaranteed, and a truncated-but-valid file is worth more
+ *      than a long file with an undetectable hole in it.
+ *
+ * Bounded time: 3 x (CD read + HAL_SD_Init + 200 ms) + close. On a REMOVED card
+ * the CD gate breaks the loop immediately, so no CMD busy-wait is ever spent.
+ * UNCERTAIN (hardware, unchanged from audit U-3): with a card that is physically
+ * present but electrically dead, HAL_SD_Init may block longer than T_IWDG =
+ * 4.095 s; then the IWDG resets the board instead of blinking code 5. The file
+ * is still safe (chunk-granular f_sync), it simply has no trailer - which
+ * parser_vibl.py now reports as "No trailer found (power loss/error)". */
+static volatile uint8_t sd_recovery_ok = 0u;   /* debugger: 1 = bus came back */
 
+static void sd_error_shutdown(void)
+{
+    uint8_t attempt;
+
+    for (attempt = 0u; attempt < SD_RECOVERY_ATTEMPTS; attempt++) {
+        /* Card detect BEFORE re-init. PA8 HIGH = inserted (SSOT
+         * doc/WEACT_F405_PINOUT.md sec.1, same polarity as main.c's startup
+         * CD-gate and diskio.c:26). A removed card makes HAL_SD_Init burn the
+         * SDIO_CMDTIMEOUT loops with no IWDG feed -> reset, never a blink. */
+        if (HAL_GPIO_ReadPin(SD_DETECT_GPIO_Port, SD_DETECT_Pin) == GPIO_PIN_RESET) {
+            break;
+        }
+        HAL_IWDG_Refresh(&hiwdg);
+        if (HAL_SD_Init(&hsd) == HAL_OK) {
+            sd_recovery_ok = 1u;
+            HAL_Delay(100);              /* let the card finish its internal state */
+            HAL_IWDG_Refresh(&hiwdg);
+            break;
+        }
+        HAL_IWDG_Refresh(&hiwdg);
+        HAL_Delay(200);                  /* GC / erase-busy settle, then retry */
+        HAL_IWDG_Refresh(&hiwdg);
+    }
+
+    /* Write the trailer while the bus may still answer. If it does not, every
+     * FatFs call inside returns fast (validate() -> FR_INVALID_OBJECT, or the
+     * bounded 1000 ms disk timeout) and vibl_abort() inside closes the file. */
+    (void)vibl_close();
+
+    /* Stop the sampler last (patch-spec order). The TIM2 callback touches RAM
+     * only (arena / full_mask / dropped), so it cannot disturb the FatFs work
+     * above; the leftover full_mask is simply never consumed again. */
+    HAL_TIM_Base_Stop_IT(&htim2);
+
+    /* R0.12c unmount is f_mount(NULL, path, 0) (ff.c:3277-3293), same call the
+     * PC13 stop path uses. */
+    (void)f_mount(NULL, "0:", 0);
+    HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin, GPIO_PIN_RESET);
+    hil3_error_loop(5);   /* parks forever, refreshing the IWDG every 200 ms */
+}
 /* USER CODE END 0 */
 
 /**
@@ -232,13 +314,22 @@ int main(void)
     dropped   = 0u;
     __enable_irq();
 
+    /* P1-8: a chunk write failure is now handled by sd_error_shutdown()
+     * (recover the bus, truncate + trailer, stop TIM2, blink code 5) instead of
+     * a bare hil3_error_loop(5), which abandoned the file mid-session. */
+    int wr_err = 0;
+
     if (m & 1u) {
-      if (vibl_write_chunk(arena[0], VIBL_SAMPLES_PER_CHUNK) != VIBL_OK) hil3_error_loop(5);
+      if (vibl_write_chunk(arena[0], VIBL_SAMPLES_PER_CHUNK) != VIBL_OK) wr_err = 1;
     }
-    if (m & 2u) {
-      if (vibl_write_chunk(arena[1], VIBL_SAMPLES_PER_CHUNK) != VIBL_OK) hil3_error_loop(5);
+    /* If the first arena already failed the bus/FS is broken: burning another
+     * 3 x 1000 ms of disk_write timeouts (diskio.c:88) on arena[1] cannot help
+     * and only eats the IWDG window, so skip straight to the shutdown. */
+    if ((m & 2u) && (wr_err == 0)) {
+      if (vibl_write_chunk(arena[1], VIBL_SAMPLES_PER_CHUNK) != VIBL_OK) wr_err = 1;
     }
     if (d) { (void)vibl_mark_gap(d); }
+    if (wr_err != 0) sd_error_shutdown();   /* never returns */
 
         HAL_IWDG_Refresh(&hiwdg);
   }
@@ -310,25 +401,40 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
     int16_t *b = arena[fill_idx];
 
-    if (lis3dsh_read(&b[fill_cnt], &b[fill_cnt + 1], &b[fill_cnt + 2]) != 0) {
-        /* P1-6: burn the slot so the arena stays aligned. Returning without
-         * advancing would re-read into the SAME slot, i.e. the last good
-         * sample repeats 1600x/s while seq / total_records keep advancing -
-         * an invisible corruption (audit WARN-2).
-         * P2-8: escalate to the error loop only after 10 consecutive failures
+    /* BLOCKER-1 fix (doc/final_pre_flash_audit.md "Blockers/BLOCKER-1", check
+     * C3): the advance+wrap block used to live ONLY on the success path, while
+     * the SPI-error path burned the slot and returned. Sequence that broke: an
+     * SPI failure at fill_cnt = 6141 -> fill_cnt = 6144 -> return; on the NEXT
+     * tick the success path ran lis3dsh_read(&b[6144], &b[6145], &b[6146]) with
+     * arena[i] indexed 0..6143 (VIBL_CHUNK_WORDS = 2048 * 3) - an out-of-bounds
+     * write into the adjacent .bss object. Secondary defect of the same
+     * asymmetry: an arena whose last slots were burned was NEVER marked full,
+     * so those samples vanished with no `dropped` count and no seq jump, and
+     * fill_idx stayed stuck on the saturated arena.
+     *
+     * Fix: read first, then fall through ONE shared advance/wrap block, so the
+     * entry invariant fill_cnt <= 6141 holds by construction for both paths.
+     * Cost: ~3 instructions inside a 625 us (1600 Hz) ISR window - no timing
+     * impact at -O2. */
+    int rc = lis3dsh_read(&b[fill_cnt], &b[fill_cnt + 1], &b[fill_cnt + 2]);
+    if (rc != 0) {
+        /* P2-8: escalate to the error loop only after 10 consecutive failures
          * (~6.3 ms of dead bus). A one-off glitch costs a single sample and is
          * NOT counted into `dropped`, because a partially invalid arena cannot
          * be reported as a clean gap without a new VIBL record type; closing
-         * that properly needs an invalid-sample flag in the record format. */
-        fill_cnt += 3u;
-        spi_err_streak++;
-        if (spi_err_streak >= 10u) {
+         * that properly needs an invalid-sample flag in the record format.
+         * The burned slot is written as a stale/zero sample inside the chunk
+         * that closes below - documented tradeoff (audit WARN-2). */
+        if (++spi_err_streak >= 10u) {
             lis3dsh_err = 1u;   /* -> hil3_error_loop(4) in the main loop */
         }
-        return;
+    } else {
+        spi_err_streak = 0u;    /* P2-8: one good frame clears the streak */
     }
-    spi_err_streak = 0u;        /* P2-8: one good frame clears the streak */
 
+    /* Shared wrap for BOTH paths (this is what closes C3): the slot is always
+     * burned and the arena is always closed at VIBL_CHUNK_WORDS, so
+     * fill_cnt < VIBL_CHUNK_WORDS at the next entry. */
     fill_cnt += 3u;
     if (fill_cnt >= VIBL_CHUNK_WORDS) {
         if (full_mask & (uint8_t)(1u << fill_idx)) {

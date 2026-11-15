@@ -45,7 +45,16 @@ def parse_file(f):
     payload_crc = 0
     # MISS-1 companion: set when the chunk loop hits the preallocated tail
     # (count == 0) — that region is uninitialized, so no trailer can be there.
-    power_loss_tail = False
+    # P0-2 (truncated-file fix): the region after the last valid chunk can be
+    # uninitialized in TWO shapes:
+    #   all 0x00 - clusters stretched by f_lseek() (P1-7) but never written
+    #              => power loss, vibl_close() never ran;
+    #   all 0xFF - blank / erased sectors a card returns after a failed write
+    #              => the SD-error shutdown path (main.c P1-8).
+    # In both cases there is NO trailer there, and probing it would print a
+    # bogus "File CRC32: 00000000 / FFFFFFFF -> MISMATCH".
+    blank_tail = False   # tail after the last chunk is all-0x00 or all-0xFF
+    cut_off    = False   # loop stopped on a partial chunk or a garbage header
 
     def trailer_candidate(p):
         # O-1 fix (doc/MILESTONE_1_SUCCESS.md §5): the chunk loop used to read the
@@ -70,8 +79,22 @@ def parse_file(f):
         #                         truncated by f_truncate() exactly at a chunk
         #                         boundary) or an unset-RTC zero-chunk trailer.
         # Without these, such a tail would be reported as a trailer + CRC MISMATCH
-        # instead of the honest "No trailer found (power loss)".
+        # instead of the honest "No trailer found (power loss/error)".
+        # P0-2: an all-0xFF 16-byte block is a blank/erased sector, never a
+        # trailer (the all-0x00 shape is already rejected by end_ts == 0).
+        if end_ts == 0xFFFFFFFFFFFFFFFF and total_records == 0xFFFFFFFF:
+            return False
         return end_ts != 0 and total_records != 0 and (end_ts & 0xFFFFFFFF) != len(chunks)
+
+    def tail_is_blank(p):
+        # P0-2: is everything from p to EOF uninitialized (all 0x00 or all 0xFF)?
+        # bytes.count(sub, start) runs in C and does not copy the slice, so a
+        # 44 MB preallocated tail is scanned in tens of ms (acceptance: < 1 s).
+        remaining = len(data) - p
+        if remaining <= 0:
+            return False
+        return (data.count(b'\x00', p) == remaining
+                or data.count(b'\xff', p) == remaining)
 
     while pos + 6 <= len(data):
         # Silence O-1: step out of the loop exactly at the trailer, no warning.
@@ -85,18 +108,25 @@ def parse_file(f):
         # After P1-7, power-loss files have ~44 MB of uninitialized tail.
         # Unwritten clusters read as count=0 -> infinite loop without this guard.
         # Non-monotonic seq = garbage (stale card data) -> also break.
-        if count == 0:
-            power_loss_tail = True
+        # count == 0    -> unwritten cluster of the preallocated tail (power loss)
+        # count == 0xFFFF -> blank/erased sector (SD-write error tail). Both mean
+        # "no trailer here"; without the 0xFF case this header falls through to
+        # the `count > 2048` break and the 16 bytes get mis-probed as a trailer.
+        if count == 0 or count == 0xFFFF:
+            blank_tail = True
             break
         if chunks and seq <= chunks[-1]['seq_number']:
+            cut_off = True      # stale card data, not a trailer
             break
 
         # Если count не равен 2048, возможно, мы наткнулись на трейлер или мусор
         if count > 2048:
+            cut_off = True      # garbage header: keep it out of the trailer probe
             break
             
         chunk_data_len = count * 6
         if pos + 6 + chunk_data_len > len(data):
+            cut_off = True   # partial chunk at EOF -> vibl_close() never ran
             print(f"⚠️ Warning: File truncated during chunk {seq}. Ignoring incomplete tail.")
             break
             
@@ -117,25 +147,34 @@ def parse_file(f):
 
     # 3. Пытаемся прочитать трейлер (если файл был корректно закрыт)
     trailer_dict = None
-    if power_loss_tail:
-        # MISS-1 companion: the chunk loop stopped inside the preallocated
-        # tail (count == 0), so the 16 bytes at `pos` are uninitialized
-        # zeros, NOT a trailer. Probing them would print a bogus
-        # "File CRC32: 00000000 -> MISMATCH".
-        print("⚠️ No trailer found (power loss)")
+    if blank_tail or cut_off or tail_is_blank(pos):
+        # P0-2 / MISS-1 companion: the chunk loop stopped either inside an
+        # uninitialized tail (all 0x00 = power loss, all 0xFF = card sectors left
+        # unwritten after an SD write error) or on a garbage / partial chunk
+        # header. In every one of those cases NO trailer exists at `pos`, so the
+        # 16 bytes must not be probed: that is what produced the bogus
+        # "File CRC32: 00000000 / FFFFFFFF -> MISMATCH" line. Chunk statistics
+        # and plotting below are still printed - the data up to the last
+        # f_sync()'ed chunk is intact and remains usable.
+        print("⚠️ No trailer found (power loss/error)")
 
     elif pos + 16 <= len(data):
         trailer_bytes = data[pos:pos+16]
-        end_ts, total_records, file_crc32 = struct.unpack('<QII', trailer_bytes)
-        # P0-1: zlib already finalized the CRC -> mask only, NO ^ 0xFFFFFFFF.
-        # This now equals C: crc32_update(0xFFFFFFFF, ...) ^ 0xFFFFFFFF.
-        calc_crc = payload_crc & 0xFFFFFFFF
-        trailer_dict = {
-            'end_ts': end_ts, 'total_records': total_records,
-            'file_crc32': file_crc32, 'calc_file_crc': calc_crc
-        }
+        if trailer_bytes == b'\x00' * 16 or trailer_bytes == b'\xff' * 16:
+            # P0-2 safety net: a blank 16-byte block is a sector, not a trailer.
+            print("⚠️ No trailer found (power loss/error)")
+        else:
+            end_ts, total_records, file_crc32 = struct.unpack('<QII', trailer_bytes)
+            # P0-1: zlib already finalized the CRC -> mask only, NO ^ 0xFFFFFFFF.
+            # This now equals C: crc32_update(0xFFFFFFFF, ...) ^ 0xFFFFFFFF.
+            calc_crc = payload_crc & 0xFFFFFFFF
+            trailer_dict = {
+                'end_ts': end_ts, 'total_records': total_records,
+                'file_crc32': file_crc32, 'calc_file_crc': calc_crc
+            }
     else:
-        print("⚠️ Warning: No trailer found (file was cut off / power loss)")
+        # Fewer than 16 bytes left: the file was cut off before any trailer.
+        print("⚠️ No trailer found (power loss/error)")
 
     return header_dict, chunks, trailer_dict
 

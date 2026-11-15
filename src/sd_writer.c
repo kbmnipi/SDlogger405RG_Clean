@@ -91,6 +91,7 @@ static volatile UINT    vibl_dbg_last_bw  = 0u;
 static volatile int     vibl_dbg_attempts = 0;
 static volatile FRESULT vibl_dbg_open_fr  = FR_OK;  /* FIX-D: last f_open() result */
 static volatile int     vibl_dbg_cd_pa8   = -1;     /* FIX-D: 1 = PA8 HIGH = card inserted */
+static volatile int     vibl_dbg_sd_error = 0;      /* P1-8: 1 = a chunk was abandoned */
 
 /* Write `len` bytes to the open file, looping in <=64 KiB f_write calls.
  *
@@ -171,6 +172,29 @@ static void vibl_abort(void)
         f_close(&vibl_fil);   /* ignore result: file already damaged/aborted */
         vibl_active = 0;
     }
+}
+
+/* P1-8 companion (main.c sd_error_shutdown): abandoning one CHUNK must NOT
+ * close the file. The failure paths of vibl_write_chunk() call this instead of
+ * vibl_abort() so that a later vibl_close() can still do its job:
+ *   - vibl_data_end and vibl_file_crc advance ONLY on successful chunks
+ *     (see the tail of vibl_write_chunk), so vibl_close()'s
+ *     f_lseek(vibl_data_end) + f_truncate() cuts away exactly the bytes of the
+ *     chunk that died midway, and the trailer it then writes covers the
+ *     surviving payload byte-for-byte;
+ *   - with vibl_abort() here, vibl_close() could only answer
+ *     VIBL_ERR_NOT_OPEN and no trailer would ever reach the card.
+ * FIL::err is cleared on purpose: after a disk error FatFs latches it
+ * (ABORT, ff.c:455) and f_write (ff.c:3627), f_lseek (ff.c:4015) and
+ * f_truncate (ff.c:4485) all return the stale code WITHOUT attempting any I/O,
+ * so the close sequence would be a silent no-op otherwise.
+ * Residual cost if a caller ever abandons a chunk without closing: the
+ * preallocated tail stays allocated until the next session, where vibl_open()
+ * truncates the old file with FA_CREATE_ALWAYS. */
+static void vibl_stall(void)
+{
+    vibl_fil.err = 0u;             /* unlatch, see above */
+    vibl_dbg_sd_error = 1;         /* debugger: which chunk was abandoned */
 }
 
 /* Convert the RTC (LSE, BIN format) to milliseconds since Unix epoch. */
@@ -380,11 +404,11 @@ int vibl_write_chunk(const int16_t *samples, uint32_t count)
     uint32_t data_len = count * VIBL_BYTES_PER_SAMPLE;   /* count * 6 */
 
     if (vibl_write_all(hdr_bytes, sizeof(chdr)) != VIBL_OK) {
-        vibl_abort();
+        vibl_stall();          /* P1-8: keep the file open for vibl_close() */
         return VIBL_ERR_WRITE;
     }
     if (vibl_write_all(samples, data_len) != VIBL_OK) {
-        vibl_abort();
+        vibl_stall();          /* P1-8: keep the file open for vibl_close() */
         return VIBL_ERR_WRITE;
     }
 
@@ -395,7 +419,7 @@ int vibl_write_chunk(const int16_t *samples, uint32_t count)
     /* Commit the chunk to SD: power loss corrupts at most this in-flight chunk. */
     FRESULT fr = f_sync(&vibl_fil);
     if (fr != FR_OK) {
-        vibl_abort();
+        vibl_stall();          /* P1-8: keep the file open for vibl_close() */
         return VIBL_ERR_SYNC;
     }
 
