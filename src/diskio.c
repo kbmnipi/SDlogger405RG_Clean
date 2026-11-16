@@ -56,19 +56,35 @@ DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
     (void)pdrv;
 
     /* HAL expects uint8_t*, cast the BYTE* */
-        /* FIX-B (this session): 200U -> 1000U. The 200 ms value from P0-4 was sized
-         * for the OLD T_IWDG=1.023 s. After P0-4 bumped IWDG_PRESCALER_32
-         * (iwdg.c: T_IWDG = 4095*32/32000 = 4.095 s), 1000 ms is the safe margin for
-         * first-touch FAT/cluster writes on a fresh card: HAL_SD_ReadBlocks returns
-         * on DATAEND/CTIMEOUT/DTIMEOUT, so 1000 ms covers card-internal GC (SD spec
-         * erase/write stall, which can reach ~1 s independently of the bus clock -
-         * the stall happens inside the card, not on the wires (P3-2 raised the
-         * transfer clock 2.667 MHz -> 12 MHz, then back to 8 MHz (src/sdio.c);
-          * that does not change this bound).
-         * A single op of
-         * 1000 ms < 4.095 s and HAL_IWDG_Refresh below feeds the dog after EVERY op,
-         * so consecutive ops can never span a reset. */
-        if (HAL_SD_ReadBlocks(&hsd, (uint8_t *)buff, sector, count, 1000U) != HAL_OK) {
+        /* FIX-B (2026-11-13): 200U -> 1000U, then FIX-B2 (bench, 2026-11-16):
+         * 1000U -> 2000U. The 200 ms value from P0-4 was sized for the OLD
+         * T_IWDG = 1.023 s; 1000 ms was set when P0-4 bumped IWDG_PRESCALER_32
+         * (iwdg.c:45-46: T_IWDG = 4095*32/32000 = 4.095 s). 2000U is now the bound
+         * because the TANK-MODE soak at 2.6667 MHz (8 min / 386 chunks, user-reported
+         * bench result) showed the failure mode is the CARD's internal garbage
+         * collection outliving 1000 ms, not the bus: HAL_SD_ReadBlocks returns on
+         * DATAEND/CTIMEOUT/DTIMEOUT, and the SD-spec erase/write stall "can reach
+         * ~1 s independently of the bus clock - the stall happens inside the card,
+         * not on the wires" (wording of this same comment since FIX-B), so a deep GC
+         * pause needs ~2 s for the card to wake up and answer the next command.
+         * The 2 s is not bought for the bus: at SDIO_CK = 48/(16+2) = 2.6667 MHz,
+         * 1-bit (src/sdio.c) one 512 B sector is on the wire 4096 bit / 2.6667 MHz =
+         * 1.54 ms = 0.08 % of the bound, and a whole 12 294 B chunk is 36.9 ms =
+         * 1.85 %, so ~98 % of the 2000 ms stays available for card-internal stall.
+         * IWDG hierarchy (FIX-E, 2026-11-16): the refresh below now runs on BOTH
+         * exit paths - success AND timeout - so a timed-out op can never eat the
+         * next op's budget and no chain of FatFs calls above us can span
+         * T_IWDG = 4095 ms without a feed. That closes doc/final_pre_flash_audit.md
+         * W-11(a) / O-12, which was harmless at 1000 ms but became marginal at
+         * 2000 ms (f_sync 2000 ms + f_close -> f_sync (src/ff.c:3821) 2000 ms
+         * = 4000 ms, 95 ms of slack).
+         * Current arithmetic of the whole write path: 1 attempt x 2000 ms
+         * (VIBL_WRITE_RETRY_MAX = 1u, src/sd_writer.c:99) + 10 ms HAL_Delay +
+         * ~500 ms of sd_error_shutdown delays (src/main.c:145-151) = ~2.5 s
+         * < 4.095 s, and every individual op restarts with a full 4.095 s budget. */
+        if (HAL_SD_ReadBlocks(&hsd, (uint8_t *)buff, sector, count, 2000U) != HAL_OK) {
+        /* FIX-E (O-12): feed the watchdog on the FAILURE path as well. */
+        HAL_IWDG_Refresh(&hiwdg);
         return RES_ERROR;
     }
 
@@ -83,13 +99,21 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
 {
     (void)pdrv;
 
-    /* FIX-B (this session): 200U -> 1000U for the same reason as disk_read above
-     * (IWDG is now 4.095 s, so 1 s per op is safe). HAL_SD_WriteBlocks returns
-     * only after DATAEND, and its Timeout only guards the FIFO-drain loop; the
-     * card-internal program/erase stall is covered by SDMMC_DATATIMEOUT inside
-     * the SDMMC peripheral, but the HAL 1 s bound is what protects us from a
-     * wedged bus. HAL_IWDG_Refresh below still runs after every call. */
-    if (HAL_SD_WriteBlocks(&hsd, (uint8_t *)buff, sector, count, 1000U) != HAL_OK) {
+    /* FIX-B -> FIX-B2: 200U -> 1000U -> 2000U, same reason as disk_read above
+     * (T_IWDG = 4.095 s, iwdg.c:45-46, so 2 s per op is the safe ceiling).
+     * HAL_SD_WriteBlocks returns only after DATAEND, and its Timeout only guards
+     * the FIFO-drain loop; the card-internal program/erase / GC stall is covered
+     * by SDMMC_DATATIMEOUT inside the SDMMC peripheral, but the HAL 2 s bound is
+     * what protects us from a wedged bus - and 2 s is what the 2.6667 MHz soak
+     * showed a deep card-GC pause needs before the card answers the next command.
+     * Hierarchy (FIX-E): the refresh below runs after EVERY bounded call - success
+     * and timeout - so one op can never starve the next one's budget.
+     * 1 attempt x 2000 ms (VIBL_WRITE_RETRY_MAX = 1u, src/sd_writer.c:99)
+     * + 10 ms HAL_Delay + ~500 ms of sd_error_shutdown delays (src/main.c:145-151)
+     * = ~2.5 s < T_IWDG = 4095 ms (iwdg.c:45-46). */
+    if (HAL_SD_WriteBlocks(&hsd, (uint8_t *)buff, sector, count, 2000U) != HAL_OK) {
+        /* FIX-E (O-12): feed the watchdog on the FAILURE path as well. */
+        HAL_IWDG_Refresh(&hiwdg);
         return RES_ERROR;
     }
 
@@ -122,16 +146,18 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
      * sectors per cluster on a 32 GB card) and on cluster alignment, because
      * ff.c clips a direct multi-sector write at the cluster boundary. Verify
      * with DWT_CYCCNT before quoting the duty again.
-     * Transfer term at the CURRENT clock (P3-2 rollback: SDIO_CK = 48/(4+2) = 8 MHz,
-     * 1-bit, src/sdio.c) = 12294*8/8e6 = 12.3 ms per chunk; at the Milestone-3
-     * clock (ClockDiv = 2 -> 12 MHz) it was 8.2 ms and at Milestone-1 (ClockDiv
-     * = 16 -> 2.667 MHz) 36.9 ms. Against 1280 ms needed to fill a chunk at 1600 Hz
-     * the consumer still runs far ahead of the producer => no arena overrun, no
-     * dropped samples.
+     * Transfer term at the CURRENT clock (TANK MODE, src/sdio.c: SDIO_CK =
+     * 48/(16+2) = 2.6667 MHz, 1-bit) = 12294*8/2.6667e6 = 36.9 ms per chunk; the
+     * retired rungs measured 12.3 ms (8 MHz) and 8.2 ms (12 MHz). Against 1280 ms
+     * needed to fill a chunk at 1600 Hz the consumer still runs ~35x ahead of the
+     * producer => no arena overrun, no dropped samples.
      * P0-3's duty arithmetic (7 % -> 27 %) was correct; only its conclusion was.
-     * HAL_IWDG_Refresh() below feeds the dog after every call (T_IWDG = 4.095 s,
-     * iwdg.c:45), so 1000 ms timeout + 3 retries (sd_writer.c:88) = 3.000 s stays
-     * inside the reset window. */
+     * FIX-E: HAL_IWDG_Refresh() now feeds the dog after EVERY bounded call -
+     * success (below, after the 10 ms delay) and timeout (before RES_ERROR) - so
+     * whatever chain FatFs builds above us (f_write / f_sync / f_lseek /
+     * f_truncate / f_close), the gap between feeds never exceeds one 2000 ms op
+     * (+ 10 ms), against T_IWDG = 4.095 s (iwdg.c:45-46).
+     * doc/final_pre_flash_audit.md W-11(a) / O-12: CLOSED by this patch. */
     HAL_Delay(10);
     HAL_IWDG_Refresh(&hiwdg);
     return RES_OK;

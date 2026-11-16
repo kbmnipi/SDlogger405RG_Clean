@@ -2,8 +2,35 @@ import struct
 import zlib
 import argparse
 import datetime
-import numpy as np
-import matplotlib.pyplot as plt
+import sys
+
+# V2-2 (LOSSY MODE, Milestone 2b): plotting is OPTIONAL.
+# numpy / matplotlib used to be imported at module scope, so a machine without
+# them crashed the parser before it could report anything. Gaps are now an
+# EXPECTED operational state (src/main.c drops the chunk whose commit exceeded
+# the 2000 ms HAL bound), so the parser must always be able to analyse a file
+# and exit with a clean, documented status code. --plot degrades to a warning.
+try:
+    import numpy as np
+    import matplotlib.pyplot as plt
+    _PLOT_OK = True
+except ImportError:
+    np = None
+    plt = None
+    _PLOT_OK = False
+
+# VIBL geometry constants (include/sd_writer.h:30-31) - also used by the gap
+# statistics, so they are not hard-coded magic numbers any more.
+VIBL_SAMPLES_PER_CHUNK = 2048
+VIBL_CHUNK_BYTES = 6 + VIBL_SAMPLES_PER_CHUNK * 6   # 12 294 B
+# Exit codes (documented contract, Milestone 2b §10.4):
+#   0 = readable, data usable. Gaps are EXPECTED and do NOT change this.
+#       A missing trailer or a mismatching trailer CRC stays a warning.
+#   2 = FATAL: the file cannot be interpreted (bad magic, too short, or neither
+#       chunks nor trailer -> nothing usable).
+#   3 = readable and usable, but the requested --plot could not be rendered
+#       (optional numpy / matplotlib missing).
+RC_OK, RC_FATAL, RC_NO_PLOT = 0, 2, 3
 
 def parse_file(f):
     data = f.read()
@@ -200,12 +227,15 @@ def main():
     parser.add_argument('--plot', action='store_true', help='Plot the data using matplotlib')
     args = parser.parse_args()
 
-    with open(args.file, 'rb') as f:
-        try:
+    try:
+        with open(args.file, 'rb') as f:
             header, chunks, trailer = parse_file(f)
-        except Exception as e:
-            print(f"❌ Parsing error: {e}")
-            return
+    except Exception as e:
+        # open() is INSIDE the try on purpose: a missing / unreadable file is a
+        # fatal input error too and must not surface as a Python traceback.
+        print(f"❌ Parsing error: {e}")
+        print(f"Exit status : {RC_FATAL} (FATAL - file cannot be interpreted)")
+        return RC_FATAL
 
     print(f"\n--- HEADER ---")
     print(f"Sensor: {header['sensor']} | Sample Rate: {header['sample_rate']} Hz")
@@ -214,13 +244,43 @@ def main():
     print(f"Number of Chunks: {len(chunks)}")
     print(f"Total Records (Chunks): {sum(c['sample_count'] for c in chunks)}")
     
-    gaps = False
+    # ---- V2-2 (LOSSY MODE, Milestone 2b) ------------------------------------
+    # A sequence jump is now an EXPECTED operational state, not an error:
+    # src/main.c drops the chunk whose commit outlived the 2000 ms HAL bound
+    # (card-internal GC stall, src/diskio.c:114) and advances next_chunk_seq with
+    # vibl_mark_gap(), so every hole shows up here as a jump > 1 and recording
+    # continued after it. Gaps are reported and quantified, and they DO NOT
+    # change the exit status: the surviving chunks are valid, usable data.
+    sr = header['sample_rate'] if header['sample_rate'] else 1600
+    gap_events = []      # (prev_seq, curr_seq, missing_chunks); prev_seq None = head gap
+
+    if chunks and chunks[0]['seq_number'] > 0:
+        # Leading hole: the session's first chunk was dropped, so NO surviving
+        # pair brackets it - the old adjacent-pair-only loop could not see it.
+        gap_events.append((None, chunks[0]['seq_number'], chunks[0]['seq_number']))
     for prev, curr in zip(chunks[:-1], chunks[1:]):
-        if curr['seq_number'] - prev['seq_number'] > 1:
-            gaps = True
-            print(f"  ⚠️ Gap detected! Seq jumped from {prev['seq_number']} to {curr['seq_number']}")
+        missing = curr['seq_number'] - prev['seq_number'] - 1
+        if missing > 0:
+            gap_events.append((prev['seq_number'], curr['seq_number'], missing))
+
+    gaps = bool(gap_events)
+    missing_chunks = sum(g[2] for g in gap_events)
+    for a, b, m in gap_events:
+        if a is None:
+            print(f"  ⚠️ Gap detected! Session head dropped: first written seq = {b} "
+                  f"({m} chunk(s) missing)")
+        else:
+            print(f"  ⚠️ Gap detected! Seq jumped from {a} to {b} "
+                  f"({m} chunk(s) = {m * VIBL_SAMPLES_PER_CHUNK} samples = "
+                  f"{m * VIBL_SAMPLES_PER_CHUNK / sr:.3f} s dropped)")
     print(f"Gaps Found: {'Yes' if gaps else 'No'}")
-    
+    if gaps:
+        print(f"Gap summary : {len(gap_events)} event(s), {missing_chunks} dropped "
+              f"chunk(s) = {missing_chunks * VIBL_SAMPLES_PER_CHUNK} samples = "
+              f"{missing_chunks * VIBL_SAMPLES_PER_CHUNK / sr:.3f} s lost")
+        print("Lossy Mode  : EXPECTED - the firmware re-inits the bus once and "
+              "keeps recording; a gap is a recorded fact, not a parse failure")
+
     if trailer:
         print(f"\n--- TRAILER ---")
         parsed_records = sum(c['sample_count'] for c in chunks)
@@ -245,18 +305,44 @@ def main():
             print(f"File status : DATA USABLE - {len(chunks)} chunks / {parsed_records} records "
                   "kept as valid; only the 16 B trailer block is unverified")
     
-    if args.plot and chunks:
-        print("\nRendering plot...")
-        x_data = np.array([r['x'] for c in chunks for r in c['records']])
-        y_data = np.array([r['y'] for c in chunks for r in c['records']])
-        z_data = np.array([r['z'] for c in chunks for r in c['records']])
+    if not chunks and trailer is None:
+        # Nothing readable survived at all: no chunk and no trailer. This is the
+        # one "looks parsed but has no data" case that IS a failure.
+        print(f"Exit status : {RC_FATAL} (FATAL - no chunks and no trailer: nothing usable)")
+        return RC_FATAL
 
-        fig, axs = plt.subplots(3, 1, figsize=(10, 8))
-        axs[0].plot(x_data, color='red'); axs[0].set_title('X Axis'); axs[0].grid(True)
-        axs[1].plot(y_data, color='green'); axs[1].set_title('Y Axis'); axs[1].grid(True)
-        axs[2].plot(z_data, color='blue'); axs[2].set_title('Z Axis'); axs[2].grid(True)
-        plt.tight_layout()
-        plt.show()
+    rc = RC_OK
+    if args.plot:
+        if not _PLOT_OK:
+            # V2-2: the analysis above is complete; only the optional figure is
+            # unavailable. Its own status code, never a traceback.
+            print("⚠️ --plot requested but numpy/matplotlib are unavailable - "
+                  "analysis complete, plot skipped")
+            rc = RC_NO_PLOT
+        elif chunks:
+            print("\nRendering plot...")
+            x_data = np.array([r['x'] for c in chunks for r in c['records']])
+            y_data = np.array([r['y'] for c in chunks for r in c['records']])
+            z_data = np.array([r['z'] for c in chunks for r in c['records']])
+
+            fig, axs = plt.subplots(3, 1, figsize=(10, 8))
+            axs[0].plot(x_data, color='red'); axs[0].set_title('X Axis'); axs[0].grid(True)
+            axs[1].plot(y_data, color='green'); axs[1].set_title('Y Axis'); axs[1].grid(True)
+            axs[2].plot(z_data, color='blue'); axs[2].set_title('Z Axis'); axs[2].grid(True)
+            plt.tight_layout()
+            plt.show()
+
+    if trailer is None:
+        verdict = "DATA USABLE - chunks recovered, no trailer (power loss / SD error)"
+    elif trailer['crc_ok']:
+        verdict = "COMPLETE - payload verified by trailer CRC"
+    else:
+        verdict = "DATA USABLE - payload valid chunk-by-chunk, trailer unverified"
+    print(f"Exit status : {rc} ({verdict}) | chunks: {len(chunks)} | gaps: "
+          f"{missing_chunks} dropped chunk(s) = "
+          f"{missing_chunks * VIBL_SAMPLES_PER_CHUNK} samples - "
+          "EXPECTED in V2 Lossy Mode, exit code unchanged by gaps")
+    return rc
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

@@ -112,8 +112,34 @@ int vibl_open(const char *filename, uint8_t sensor_id, uint8_t range_g, uint16_t
  * Append one chunk: [chunk_hdr][count*record]. The running file CRC is updated
  * with the exact bytes written (chunk header + samples), then f_sync() commits
  * the chunk to SD and the IWDG is fed. Power loss corrupts at most this chunk.
+ *
+ * V2 LOSSY MODE (V2-1): the call is SELF-ALIGNING. Before writing, the file
+ * pointer is verified to sit at vibl_data_end (the last committed payload byte)
+ * and is rewound there when a previous chunk was abandoned, so an abandoned
+ * chunk's partial bytes are overwritten by the next chunk instead of leaving an
+ * undetectable hole in the middle of the stream. f_tell() is a macro over
+ * fp->fptr (ff.h:278), so the healthy path pays one integer compare.
  */
 int vibl_write_chunk(const int16_t *samples, uint32_t count);
+
+/**
+ * V2 LOSSY MODE (V2-1) recovery primitive - closes O-11 of
+ * doc/final_pre_flash_audit.md ("f_lseek(vibl_data_end) + FIL.err unlatch").
+ * After vibl_write_chunk() failed:
+ *   - clears the FatFs error latch FIL::err (ABORT, ff.c:455; f_write ff.c:3627
+ *     and f_lseek ff.c:4015 would otherwise return the stale code WITHOUT doing
+ *     any I/O, i.e. every following chunk would fail instantly);
+ *   - rewinds the file pointer to vibl_data_end so the next chunk is appended
+ *     at the last committed byte;
+ *   - rolls the running file CRC back to the state it had before the abandoned
+ *     chunk, so the trailer CRC still matches the surviving payload exactly.
+ * Returns VIBL_OK when recording may continue; VIBL_ERR_NOT_OPEN when no file is
+ * open; VIBL_ERR_SEEK when the stream cannot be realigned (the caller must then
+ * close the file - vibl_close() still works, err was cleared again).
+ * Never re-mounts the volume: that would bump fs->id (ff.c:3192) and invalidate
+ * the open FIL (validate(), ff.c:3224).
+ */
+int vibl_recover(void);
 
 /**
  * Record a data gap of `dropped_count` samples (e.g. dropped READY buffers).
@@ -121,6 +147,9 @@ int vibl_write_chunk(const int16_t *samples, uint32_t count);
  * chunk header: the skipped seq_numbers are simply not written, so the PC
  * parser detects "seq_number jump > 1". The exact sample count is latched for
  * reporting / error code 4.
+ * In Lossy MODE this is also how a dropped SD chunk is announced:
+ * main.c calls vibl_mark_gap(VIBL_SAMPLES_PER_CHUNK) per lost chunk, so every
+ * hole becomes visible to parser_vibl.py instead of silently shortening the file.
  */
 int vibl_mark_gap(uint32_t dropped_count);
 
@@ -136,6 +165,7 @@ uint32_t    vibl_get_total_records(void);
 uint32_t    vibl_get_chunk_count(void);
 uint32_t    vibl_get_dropped_samples(void);
 int         vibl_overflow_latched(void);
+uint32_t    vibl_get_recover_count(void);   /* V2-1: chunks abandoned + recovered */
 
 /**
  * P2-9 (audit WARN-4): start timestamp taken by vibl_open().

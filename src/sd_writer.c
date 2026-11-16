@@ -45,6 +45,17 @@ static uint8_t       vibl_prealloc_mode = VIBL_PREALLOC_NONE;
  * with ^0xFFFFFFFF only when the trailer value is produced.               */
 static uint32_t      vibl_file_crc     = 0xFFFFFFFFu;
 
+/* V2-1 (LOSSY MODE, 2026-11-16) ------------------------------------------
+ * CRC state as it was BEFORE the chunk that is currently being attempted.
+ * vibl_write_chunk() folds the chunk's bytes into vibl_file_crc BEFORE the
+ * committing f_sync() (see the tail of vibl_write_chunk: CRC at :498-499,
+ * f_sync at :502), so a chunk that dies in f_sync would otherwise leave
+ * 12 294 bytes inside the running CRC while those bytes are being abandoned.
+ * vibl_stall() restores this snapshot, which is what keeps the trailer CRC
+ * correct across an arbitrary number of dropped chunks - the whole point of
+ * Lossy Mode (doc/MILESTONE_2_ROBUSTNESS.md §10). */
+static uint32_t      vibl_chunk_crc_start = 0xFFFFFFFFu;
+
 /* Sensor name table indexed by sensor_id (written into header.sensor[16]). */
 static const char *const vibl_sensor_names[] = {
     "HIL-DAC-ADC",   /* VIBL_SENSOR_HIL   : HIL DAC->ADC loopback           */
@@ -96,7 +107,7 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
  * FR_INVALID_OBJECT(9) and FR_DENIED(7) - the three failures this project has
  * actually seen. Cost: 3 words + 1 word in .bss, no extra flash in hot code.
  */
-#define VIBL_WRITE_RETRY_MAX 3u
+#define VIBL_WRITE_RETRY_MAX 1u   /* FIX-F (2026-11-16): 3u -> 1u. 3 attempts x 2000 ms = 6 s of blocking is worse than going straight to sd_error_shutdown(). */
 static volatile FRESULT vibl_dbg_last_fr  = FR_OK;
 static volatile UINT    vibl_dbg_last_bw  = 0u;
 static volatile int     vibl_dbg_attempts = 0;
@@ -104,6 +115,11 @@ static volatile FRESULT vibl_dbg_open_fr  = FR_OK;  /* FIX-D: last f_open() resu
 static volatile int     vibl_dbg_cd_pa8   = -1;     /* FIX-D: 1 = PA8 HIGH = card inserted */
 static volatile int     vibl_dbg_sd_error = 0;      /* P1-8: 1 = a chunk was abandoned */
 static volatile FRESULT vibl_dbg_expand_fr = FR_OK; /* P3-1: f_expand() result; 7 = FR_DENIED -> stretch fallback */
+/* V2-1 (LOSSY MODE): number of chunks abandoned AND successfully recovered in
+ * this session. 0 = lossless run; > 0 = the file contains that many seq holes.
+ * Read it in the watch window together with vibl_dbg_sd_error and with
+ * vibl_get_dropped_samples() / vibl_get_chunk_count(). */
+static volatile uint32_t vibl_dbg_recover_count = 0u;
 
 /* Write `len` bytes to the open file, looping in <=64 KiB f_write calls.
  *
@@ -124,9 +140,9 @@ static volatile FRESULT vibl_dbg_expand_fr = FR_OK; /* P3-1: f_expand() result; 
  *    does NOT set fp->err - it is a drive-state rejection, not an abort.
  *
  * The retry is defense-in-depth against transient FR_DISK_ERR (card GC stall).
- * It deliberately does NOT mask a persistent state error: after 3 attempts the
- * original code still fails with VIBL_ERR_WRITE, with the real FRESULT left in
- * vibl_dbg_last_fr. */
+ * It deliberately does NOT mask a persistent state error: after VIBL_WRITE_RETRY_MAX
+ * attempts (1 since FIX-F) it still fails with VIBL_ERR_WRITE - real FRESULT in
+ * vibl_dbg_last_fr - and the caller routes straight to sd_error_shutdown(). */
 static int vibl_write_all(const void *buf, uint32_t len)
 {
     const uint8_t *p = (const uint8_t *)buf;
@@ -165,9 +181,11 @@ static int vibl_write_all(const void *buf, uint32_t len)
                 return VIBL_ERR_WRITE;
             }
 
-            /* A retry attempt can itself burn up to the FIX-B write timeout, so
-             * re-feed the watchdog here: worst case 3 x 1000 ms = 3.000 s,
-             * still < T_IWDG = 4.095 s (iwdg.c P0-4, PRESCALER_32). */
+            /* FIX-E made disk_read/disk_write feed the dog on BOTH exit paths, so
+             * no bounded op can starve the next one; this feed is the second belt.
+             * With VIBL_WRITE_RETRY_MAX = 1u (FIX-F) one chunk costs at most
+             * 1 x 2000 ms, i.e. the gap between feeds stays ~2.0 s + 10 ms, well
+             * under T_IWDG = 4.095 s (iwdg.c:45-46, PRESCALER_32 / Reload 4095). */
             HAL_IWDG_Refresh(&hiwdg);
         }
 
@@ -186,27 +204,75 @@ static void vibl_abort(void)
     }
 }
 
-/* P1-8 companion (main.c sd_error_shutdown): abandoning one CHUNK must NOT
- * close the file. The failure paths of vibl_write_chunk() call this instead of
- * vibl_abort() so that a later vibl_close() can still do its job:
- *   - vibl_data_end and vibl_file_crc advance ONLY on successful chunks
- *     (see the tail of vibl_write_chunk), so vibl_close()'s
- *     f_lseek(vibl_data_end) + f_truncate() cuts away exactly the bytes of the
- *     chunk that died midway, and the trailer it then writes covers the
- *     surviving payload byte-for-byte;
+/* P1-8 companion (main.c sd_error_shutdown) / V2-1 (main.c Lossy Mode):
+ * abandoning one CHUNK must NOT close the file. The failure paths of
+ * vibl_write_chunk() call this instead of vibl_abort() so that the session can
+ * EITHER be finished cleanly (old shutdown path) OR continued with the next
+ * chunk (Lossy Mode):
+ *   - vibl_data_end advances ONLY on successful chunks (see the tail of
+ *     vibl_write_chunk), so it is the authority for "last committed byte";
+ *   - vibl_file_crc is rolled back to vibl_chunk_crc_start here, because it was
+ *     already folded with the abandoned chunk's bytes before f_sync() failed;
+ *     without the rollback the trailer CRC would not match the surviving
+ *     payload and the parser would report a mismatch on a perfectly good file;
+ *   - FIL::err is cleared on purpose: after a disk error FatFs latches it
+ *     (ABORT, ff.c:455) and f_write (ff.c:3627), f_lseek (ff.c:4015) and
+ *     f_truncate (ff.c:4485) all return the stale code WITHOUT attempting any
+ *     I/O, so without the unlatch neither the next chunk nor the close
+ *     sequence would do anything at all;
  *   - with vibl_abort() here, vibl_close() could only answer
  *     VIBL_ERR_NOT_OPEN and no trailer would ever reach the card.
- * FIL::err is cleared on purpose: after a disk error FatFs latches it
- * (ABORT, ff.c:455) and f_write (ff.c:3627), f_lseek (ff.c:4015) and
- * f_truncate (ff.c:4485) all return the stale code WITHOUT attempting any I/O,
- * so the close sequence would be a silent no-op otherwise.
- * Residual cost if a caller ever abandons a chunk without closing: the
- * preallocated tail stays allocated until the next session, where vibl_open()
- * truncates the old file with FA_CREATE_ALWAYS. */
+ * This function performs NO disk I/O - the stream realignment is done by
+ * vibl_rewind_to_data_end() below, so the shutdown path (vibl_close() seeks on
+ * its own) stays exactly as cheap and as safe as before. */
 static void vibl_stall(void)
 {
-    vibl_fil.err = 0u;             /* unlatch, see above */
-    vibl_dbg_sd_error = 1;         /* debugger: which chunk was abandoned */
+    vibl_file_crc    = vibl_chunk_crc_start;  /* V2-1: drop the dead chunk from the CRC */
+    vibl_fil.err     = 0u;                    /* unlatch, see above                     */
+    vibl_dbg_sd_error = 1;                    /* debugger: a chunk was abandoned        */
+}
+
+/* V2-1 (LOSSY MODE) stream realignment. Closes O-11 of
+ * doc/final_pre_flash_audit.md, which asked for exactly this primitive
+ * ("f_lseek(vibl_data_end) + FIL.err unlatch, i.e. a future vibl_recover_chunk()").
+ *
+ * WHY IT IS MANDATORY BEFORE CONTINUING: f_write() advances fp->fptr by exactly
+ * the bytes it managed to commit (ff.c:3635-3637 - the loop increments run only
+ * for iterations that did not ABORT; ABORT returns from inside the body). A dead
+ * chunk therefore leaves 0..12 294 bytes punched between vibl_data_end and fptr.
+ * Appending the next chunk at that fptr would put a chunk header in the middle
+ * of the previous chunk's sample data and parser_vibl.py would read int16
+ * samples as a 6-byte header (seq/count garbage) - an UNDETECTABLE hole, which
+ * is precisely why Milestone 2 chose to end the session. Rewinding makes the hole
+ * explicit instead: the next chunk overwrites the dead range byte-for-byte
+ * (both are 6 + 2048*6 = 12 294 B), and the gap is reported by the sequence jump.
+ *
+ * Cost: free on the healthy path (f_tell is the macro (fp)->fptr, ff.h:278 - no
+ * I/O; the compare fails out immediately because fptr == vibl_data_end between
+ * chunks). On a recovery it costs one FatFs backward seek: f_lseek walks the
+ * cluster chain from the first cluster (ff.c:4092-4103) using create_chain(),
+ * which returns the EXISTING next cluster without put_fat (ff.c:1369), plus at
+ * most one sector-cache write-back and one sector read (ff.c:4141-4148) - both
+ * bounded by the 2000 ms HAL timeout and both feeding the IWDG on success AND on
+ * failure (src/diskio.c:87, :116). */
+static int vibl_rewind_to_data_end(void)
+{
+    if (vibl_data_end < (uint32_t)VIBL_HEADER_SIZE) {
+        return 0;      /* no chunk committed yet: payload starts at 256 by design */
+    }
+    if (vibl_fil.err != 0u) {
+        vibl_fil.err = 0u;   /* else f_lseek answers the stale code, ff.c:4015 */
+    }
+    if ((uint32_t)f_tell(&vibl_fil) != vibl_data_end) {
+        if (f_lseek(&vibl_fil, (FSIZE_t)vibl_data_end) != FR_OK) {
+            vibl_fil.err = 0u;   /* leave vibl_close() working: no silent no-op */
+            return -1;
+        }
+        if ((uint32_t)f_tell(&vibl_fil) != vibl_data_end) {
+            return -1;           /* size clipped (disk full) or chain damaged */
+        }
+    }
+    return 0;
 }
 
 /* Convert the RTC (LSE, BIN format) to milliseconds since Unix epoch. */
@@ -306,9 +372,16 @@ int vibl_open(const char *filename, uint8_t sensor_id, uint8_t range_g, uint16_t
     chunk_count      = 0u;
     total_dropped    = 0u;
     overflow_latched = 0;
-    vibl_data_end    = 0u;
+    /* V2-1 (LOSSY MODE): seeded at the END of the header instead of 0, because
+     * vibl_rewind_to_data_end() (called by every vibl_write_chunk) needs a valid
+     * anchor from the first chunk on: at this point fptr == 256 == vibl_data_end,
+     * so the guard is a no-op and never seeks to 0. vibl_close()'s zero-chunk
+     * branch stays as a belt for the (now unreachable) 0 case. */
+    vibl_data_end    = (uint32_t)VIBL_HEADER_SIZE;
     vibl_prealloc_mode = VIBL_PREALLOC_NONE;
     vibl_file_crc    = 0xFFFFFFFFu;            /* running (un-finalized) state */
+    vibl_chunk_crc_start = 0xFFFFFFFFu;        /* V2-1 rollback anchor         */
+    vibl_dbg_recover_count = 0u;               /* V2-1 new session => fresh log */
 
     FRESULT fr = f_open(&vibl_fil, filename, FA_CREATE_ALWAYS | FA_WRITE);
     if (fr != FR_OK) {
@@ -483,6 +556,18 @@ int vibl_write_chunk(const int16_t *samples, uint32_t count)
     const uint8_t *hdr_bytes = (const uint8_t *)&chdr;
     uint32_t data_len = count * VIBL_BYTES_PER_SAMPLE;   /* count * 6 */
 
+    /* V2-1 (LOSSY MODE) self-aligning guard: a chunk is ALWAYS appended at
+     * vibl_data_end, so an abandoned chunk's partial bytes are overwritten by
+     * the next chunk instead of leaving an undetectable hole mid-stream.
+     * Healthy path cost = one integer compare (f_tell is the macro (fp)->fptr,
+     * ff.h:278 - no disk access). If the rewind itself fails the FIL is damaged
+     * beyond this chunk: report it and let main.c fall back to the shutdown. */
+    if (vibl_rewind_to_data_end() != 0) {
+        vibl_stall();          /* unlatch + CRC rollback, no I/O */
+        return VIBL_ERR_WRITE;
+    }
+    vibl_chunk_crc_start = vibl_file_crc;   /* rollback anchor for vibl_stall() */
+
     if (vibl_write_all(hdr_bytes, sizeof(chdr)) != VIBL_OK) {
         vibl_stall();          /* P1-8: keep the file open for vibl_close() */
         return VIBL_ERR_WRITE;
@@ -514,6 +599,33 @@ int vibl_write_chunk(const int16_t *samples, uint32_t count)
      * to ~200 ms, well under the ~1-1.5 s IWDG timeout, but this guarantees it. */
     HAL_IWDG_Refresh(&hiwdg);
 
+    return VIBL_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* V2-1 (LOSSY MODE, 2026-11-16): recover the writer after an abandoned chunk. */
+/* Call order required by main.c: vibl_write_chunk() fails -> main.c marks the */
+/* gap -> main.c re-inits the bus with ONE HAL_SD_Init() -> vibl_recover() ->  */
+/* next vibl_write_chunk(). No FatFs re-mount anywhere in this sequence:       */
+/* re-mounting would bump fs->id (ff.c:3192) and invalidate the open FIL       */
+/* (validate(), ff.c:3224) - doc/MILESTONE_2_ROBUSTNESS.md §4.2a.              */
+/* -------------------------------------------------------------------------- */
+int vibl_recover(void)
+{
+    if (vibl_active == 0) {
+        return VIBL_ERR_NOT_OPEN;
+    }
+    if (vibl_rewind_to_data_end() != 0) {
+        return VIBL_ERR_SEEK;   /* chain damaged / size clipped: not recoverable */
+    }
+    /* The abandoned chunk's bytes stay inside objsize until either the next
+     * chunk overwrites them (normal case) or vibl_close()'s f_truncate() cuts
+     * the tail (session ended on a failed chunk). Deliberately NO f_truncate()
+     * here: in STRETCH mode it would release the whole preallocated tail
+     * (~10 800 put_fat calls, 0.3-0.5 s) and force re-allocation for every
+     * following chunk. Only the <= 3 clusters of the dead chunk stay allocated. */
+    vibl_dbg_recover_count++;   /* debugger: how many chunks this session survived */
+    HAL_IWDG_Refresh(&hiwdg);
     return VIBL_OK;
 }
 
@@ -641,6 +753,7 @@ uint32_t    vibl_get_total_records(void)  { return total_records; }
 uint32_t    vibl_get_chunk_count(void)    { return chunk_count; }
 uint32_t    vibl_get_dropped_samples(void){ return total_dropped; }
 int         vibl_overflow_latched(void)   { return overflow_latched; }
+uint32_t    vibl_get_recover_count(void)  { return vibl_dbg_recover_count; }
 /* P2-9 (audit WARN-4): 0 => the RTC was unreadable when the session opened
  * (LSE not running), so header.start_ts and every FAT mtime are meaningless. */
 uint64_t    vibl_get_start_ts(void)       { return vibl_hdr.start_ts; }
